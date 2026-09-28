@@ -51,25 +51,43 @@ class OpenAIRunner:
 
         return OpenAI(**(self.client_kwargs or {}))
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    def _completion_options(self) -> dict[str, float]:
+        """Return sampling options supported by the configured model.
+
+        The lab's optional gpt-5.6 models only accept the default temperature
+        value.  Omitting the parameter lets the SDK/API apply that default,
+        while older models and OpenRouter's Blue model keep their configured
+        temperature.
+        """
+        if _requires_default_temperature(self.model):
+            return {}
+        return {"temperature": self.temperature}
+
+    async def chat(
+        self,
+        agent: OpenAIAgent,
+        user_message: str,
+        user_id: str = "student",
+    ) -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self._run_input_plugins(user_message, user_id=user_id)
         if block_msg is not None:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
+        request = dict(
             model=self.model,
             messages=[
                 {"role": "system", "content": agent.instruction},
                 {"role": "user", "content": user_message},
             ],
-            temperature=self.temperature,
         )
+        request.update(self._completion_options())
+        completion = client.chat.completions.create(**request)
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
@@ -78,7 +96,9 @@ class OpenAIRunner:
         text = await self._run_output_plugins(text)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def _run_input_plugins(
+        self, user_message: str, *, user_id: str = "student"
+    ) -> str | None:
         if not self.plugins:
             return None
         try:
@@ -90,7 +110,7 @@ class OpenAIRunner:
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
@@ -152,6 +172,18 @@ def _content_to_text(content: Any) -> str:
         if t:
             chunks.append(t)
     return "".join(chunks)
+
+
+def _requires_default_temperature(model: str) -> bool:
+    """Whether the model rejects custom ``temperature`` values."""
+    return model.strip().lower().startswith("gpt-5.6-")
+
+
+def completion_options(model: str, temperature: float) -> dict[str, float]:
+    """Build optional sampling parameters for a direct OpenAI SDK call."""
+    if _requires_default_temperature(model):
+        return {}
+    return {"temperature": temperature}
 
 
 def _make_pair(
